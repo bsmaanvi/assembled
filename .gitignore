@@ -1,0 +1,6 @@
+/rules.txt
+/rules.txt.tmp.*
+
+/build/
+/data/
+/tests/__pycache__/
