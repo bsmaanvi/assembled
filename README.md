@@ -55,25 +55,6 @@ backlog = warning. Use **Add a queue** on the rules page to register another
 queue ID and display name. New queues wait for observations; registration does
 not create tickets or an upstream integration. All notifications belong to the trusted demo team lead.
 
-## JSONL replay
-
-Import `fixtures/synthetic-queues.jsonl` into a fresh workspace after configuring
-the two Billing rules. Its seven events produce **four** notifications and leave
-two active violations. Re-importing the same file creates no new notifications.
-The actual assignment feed has also been validated in an isolated environment;
-use the environment-variable command below to reproduce the dataset regression.
-
-The importer accepts queue snapshots in the assignment schema, including UTC
-`ts` strings in `YYYY-MM-DDTHH:MM:SSZ` format. The four contextual metrics
-`agents_available`, `agents_on_call`, `volume_last_15m`, and
-`volume_forecast_next_15m` are stored and displayed. They are optional,
-nonnegative integer counts: omitted/null fields mean **not reported**, not zero.
-Older state files still load; previously discarded values cannot be recovered.
-Known agent event types are skipped and counted explicitly; other event types
-are rejected. Queue events are stably sorted by timestamp. Equal-time events
-retain input order. A bad batch makes no changes, including conflicts discovered
-partway through evaluation. The current workspace is not implicitly reset.
-
 ## Product semantics
 
 - Equivalent definitions (queue, rule type, and backlog threshold) cannot be
@@ -126,49 +107,11 @@ partway through evaluation. The current workspace is not implicitly reset.
 | `web/` | Dashboard, rule editor, toasts, and polling |
 | `fixtures/` | Labeled synthetic data with known outcomes |
 
-Schema-1 JSON snapshots still load with the original catalog; the next save
-writes schema 2, including the catalog and stable notification-ID counter.
-Existing rules and observations are preserved. Back up your state before a
-version upgrade; older binaries cannot read schema 2. Legacy duplicate definitions
-remain until the lead explicitly changes or disables them.
-
 The browser displays decisions; it never evaluates rules. A mutex serializes
 application reads and writes within the process. An advisory file lock rejects
 another server using the same state file. No authentication or production
 permissions system is implied by the demo identity.
 
-## Persistence and failure guarantees
-
-For each mutation, copy the current rules and engine, apply and validate the
-change, serialize the whole candidate into a unique same-directory temporary
-file, flush the file, and atomically rename it over the snapshot. Only after a
-successful save is the candidate published in memory.
-
-This keeps event deduplication, latest observations, active episodes, and
-notification creation in the same persisted snapshot. A failed save does not
-consume a rule ID or expose partial changes. A process killed after a successful
-save can restore the state and safely handle event retries. Corrupt or unsupported
-state stops startup and is not silently replaced.
-
-This is a **single-process, single-writer** design. Whole-state copies and writes
-are deliberately simple, not a high-throughput event store. The dashboard's **Manage retained history** control offers explicit compaction.
-It keeps the requested recent notifications/events plus all active alerts,
-notification source events, and all queue-watermark events (including timestamp
-ties). Active records can exceed the chosen targets. Removed history is permanent;
-after an old event ID is evicted, its retry is no longer classified as a duplicate
-or conflict, but its older timestamp still cannot change current queue state.
-IDs are never renumbered or reused after cleanup. Cleanup is not automatic, so
-normal saves never silently delete history. Archive your state before pruning.
-The 32 MiB hard snapshot limit still rejects oversized saves. HTTP payloads are capped at 2 MiB.
-
-The temporary file is fsynced. After atomic rename, the parent directory is
-also fsynced when supported. Directory-sync failure is logged rather than
-incorrectly reporting that a committed rename was rolled back. We still do
-**not** claim complete machine/power-loss durability across all platforms. There is no claim of exactly-once
-external delivery or exactly-once browser toasts. Production evolution would need
-retention, stronger durable storage, and partitioned processing, with a per-entity
-ordering contract. A circuit breaker, MCP server, or consensus cluster does not
-solve the failures addressed by this MVP.
 
 ## Tests
 
@@ -184,31 +127,11 @@ recoveries, priority, abrupt process restart, duplicate/stale/conflicting events
 batch rollback, failed saves, writer exclusion, and corrupt-state preservation, schema migration, queue creation, duplicate
 configuration prevention, and retention with stable IDs.
 
-Optional browser acceptance checks require Python Playwright and a Chromium
-installation (already available in the development environment):
-
-```sh
-python3 tests/browser_smoke.py
-```
-
-Set `CHROMIUM` to your Chromium executable if it differs from `/usr/bin/chromium`.
-This test uses temporary state, operates the real forms, verifies toasts and
-recovery, and checks desktop/mobile layouts. Screenshots go to
-`/tmp/intraday-artifacts` by default; override with `ARTIFACT_DIR`.
-
 To include the supplied assignment feed without committing it to the repository:
 
 ```sh
 INTRADAY_EVENTS_FILE=/path/to/events.jsonl bash test.sh
 ```
-
-These three checks independently calculate expected episodes, compare actual
-notification evidence, re-import after restart/cleanup, and exercise original
-arrival ordering. With Billing backlog >20 and SLA rules, the reviewed file
-creates two recovered notifications. With the same two rule types on all three
-queues, it creates three. It contains 24 queue events and 72 explicitly skipped
-agent events. The feed includes a null forecast, a late VIP observation, and a
-conflicting repeated adherence ID outside this MVP's evaluated scope.
 
 ## HTTP API
 
@@ -223,28 +146,3 @@ conflicting repeated adherence ID outside this MVP's evaluated scope.
 | POST | `/api/replay` | Import raw JSONL atomically |
 | POST | `/api/demo/next` | Advance one synthetic scenario step |
 | POST | `/api/maintenance/compact` | Explicitly prune unprotected historical state |
-
-Mutation requests require `X-Intraday-Client: dashboard`. The backend provides no
-cross-origin permissions. This reduces accidental cross-site mutations; it is
-not an authentication mechanism. Errors use 400 for validation, 404 for unknown
-rule IDs, 409 for conflicting event IDs, duplicate queues, or equivalent rules, and 500 for failed persistence.
-
-## Interview framing and AI use
-
-The product decision is a focused queue-monitoring workflow for team leads.
-Agent self-reminders, supervisor summaries, long-call timers, forecast-based rules, and real
-notification integrations are deferred. Composite staffing/backlog rules and
-individual-agent offline tracking are also deferred; this change adds context,
-not an unsupported inference about staffing causes. Demonstrate a complete configuration →
-observation → alert → suppression → recovery loop before discussing extensions.
-
-The systems-design contribution is idempotency, per-queue ordering, and atomic
-snapshot recovery—not extra infrastructure. The failure tests are evidence for
-those guarantees and their limits.
-
-OpenAI Codex assisted with design discussion, implementation, and test generation.
-Generated changes were checked with unit tests, actual HTTP requests, restart and
-save-failure tests, and Chromium interaction tests. The candidate should review
-and explain these decisions personally; these checks do not substitute for that
-understanding. Third-party libraries and their licenses are listed in
-`third_party/README.md`.
