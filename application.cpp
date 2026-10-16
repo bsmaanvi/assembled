@@ -22,6 +22,7 @@ std::string outcome_name(SnapshotOutcome outcome) {
     }
     throw std::logic_error("Unknown snapshot outcome");
 }
+// converting the notifications into json
 Json result_json(const SnapshotResult& result) {
     Json notifications = Json::array();
     for (const auto& notification : result.new_notifications)
@@ -36,7 +37,10 @@ Json Application::encode(const State& state) {
     return {{"schema_version", 1}, {"rules", rules}, {"demo_cursor", state.demo_cursor},
             {"engine", Json::parse(state.engine.export_state())}};
 }
-
+// checks for an existing file and if it exists parses and validates the json and restores 
+// the rules and restores the wrokspace
+// A missing file means a fresh workspace; a malformed or inconsistent file causes visible startup failure 
+// rather than silently losing configuration or notification history
 Application::Application(std::filesystem::path path) : path_(std::move(path)) {
     if (!std::filesystem::exists(path_)) return;
     if (!std::filesystem::is_regular_file(path_) || std::filesystem::file_size(path_) > 32 * 1024 * 1024)
@@ -53,6 +57,8 @@ Application::Application(std::filesystem::path path) : path_(std::move(path)) {
     state_.engine = NotificationEngine::restore(saved.at("engine").dump(), state_.rules.rules());
 }
 
+// write the complete proposed state to a temporary file, flush it, and atomically replace the snapshot before 
+// publishing it in memory. This avoids partial application writes and keeps failed saves from exposing unpersisted changes.
 void Application::commit(State candidate) {
     const std::string payload = encode(candidate).dump(2) + "\n";
     if (payload.size() > 32 * 1024 * 1024)
@@ -82,7 +88,9 @@ void Application::commit(State candidate) {
     state_ = std::move(candidate);
 }
 
+// organizes and orders the info for the front end
 Json Application::view() const {
+    // locks the mutex to stop changes
     const std::lock_guard lock(mutex_);
     Json queues = Json::array(), rules = Json::array(), alerts = Json::array(), notifications = Json::array();
     const auto active = state_.engine.active_rule_ids();
@@ -129,7 +137,11 @@ Json Application::view() const {
     return {{"queues", queues}, {"rules", rules}, {"active_alerts", alerts},
             {"notifications", notifications}, {"demo_cursor", state_.demo_cursor}};
 }
+// view() builds a consistent read model for the frontend under the application mutex. 
+// It combines latest observations, derived rule statuses, prioritized active episodes, 
+// and original notification history. The frontend renders those decisions rather than evaluating rules itself.
 
+// lead saves a new rule
 Json Application::create_rule(const Json& input) {
     const std::lock_guard lock(mutex_);
     auto candidate = state_;
@@ -140,6 +152,7 @@ Json Application::create_rule(const Json& input) {
     return {{"id", id}};
 }
 
+// Lead edits, enables, or disables a rule
 Json Application::update_rule(int id, const Json& input) {
     const std::lock_guard lock(mutex_);
     if (!input.is_object() || (!input.contains("type") && !input.contains("enabled")))
@@ -152,6 +165,7 @@ Json Application::update_rule(int id, const Json& input) {
     return {{"id", id}};
 }
 
+// One event arrives
 Json Application::ingest(const Json& input) {
     const std::lock_guard lock(mutex_);
     auto candidate = state_;
@@ -160,6 +174,7 @@ Json Application::ingest(const Json& input) {
     return result_json(result);
 }
 
+// a jsonl file is imported
 Json Application::replay(const std::string& jsonl) {
     const std::lock_guard lock(mutex_);
     std::istringstream lines(jsonl);
@@ -197,6 +212,7 @@ Json Application::replay(const std::string& jsonl) {
             {"skipped_agent_events", skipped}, {"notifications_created", created}};
 }
 
+// Someone clicks “Next demo event”
 Json Application::next_demo() {
     const std::lock_guard lock(mutex_);
     auto candidate = state_;

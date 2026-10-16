@@ -16,6 +16,7 @@ auto find_rule(std::vector<QueueRule>& rules, int id) {
 }
 } // namespace
 
+// constructor with rules passed
 RuleCollection::RuleCollection(std::vector<QueueRule> rules) {
     std::set<int> ids;
     for (const auto& rule : rules) {
@@ -25,8 +26,10 @@ RuleCollection::RuleCollection(std::vector<QueueRule> rules) {
     }
     rules_ = std::move(rules);
 }
-
+ 
+// read the stored rules
 const std::vector<QueueRule>& RuleCollection::rules() const { return rules_; }
+
 
 void RuleCollection::validate_definition(const RuleDefinition& definition) {
     std::visit([](const auto& value) {
@@ -38,6 +41,10 @@ void RuleCollection::validate_definition(const RuleDefinition& definition) {
         backlog && backlog->tickets_waiting_threshold < 0)
         throw std::invalid_argument("Threshold must be nonnegative.");
 }
+// stretch goal 
+// I distinguish restoring trusted application state from importing user input.
+// Restoration fails visibly rather than silently dropping rules. Partial imports would 
+// require an explicit result showing exactly what was accepted and rejected.
 
 int RuleCollection::create(RuleDefinition definition) {
     validate_definition(definition);

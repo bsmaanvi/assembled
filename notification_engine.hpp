@@ -50,16 +50,16 @@ public:
 private:
     struct RuleState {
         QueueRule configuration;
-        bool firing = false;
+        bool firing = false; // differentiates new viilation from the old one
         std::size_t notification_id = 0;
     };
     std::vector<Notification> evaluate(const QueueRule& rule, const QueueSnapshot& snapshot,
                                        const std::string& trigger);
     void close_episode(int id, const std::string& reason);
-    std::unordered_map<int, RuleState> rule_states_;
-    std::unordered_map<std::string, QueueSnapshot> latest_snapshots_;
-    std::unordered_map<std::string, QueueSnapshot> events_;
-    std::unordered_map<std::string, std::int64_t> latest_observations_;
+    std::unordered_map<int, RuleState> rule_states_; // rule id rule state
+    std::unordered_map<std::string, QueueSnapshot> latest_snapshots_; //queue ID - latest accepted snapshot for that queue
+    std::unordered_map<std::string, QueueSnapshot> events_; //event_id snapshot received under that event id
+    std::unordered_map<std::string, std::int64_t> latest_observations_; // queue_id latest accepted observation timestamp
     std::vector<Notification> notifications_;
 };
 
