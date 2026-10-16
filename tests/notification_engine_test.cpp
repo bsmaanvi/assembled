@@ -246,6 +246,43 @@ void optional_context_validation() {
     check(engine.process(negative, {}).outcome == SnapshotOutcome::Processed,
           "Rejected context must not consume event ID; zero counts are valid");
 }
+// The indexed production path evaluates explicitly registered queues.
+void indexed_path_accepts_registered_queue() {
+    RuleCollection rules;
+    rules.add_queue({"refunds", "Refunds"});
+    const int id = rules.create(BacklogRule{"refunds", 20});
+    NotificationEngine engine;
+    const auto result = engine.process_validated(snapshot("refunds-event", 1, 21, 0, 120, "refunds"), rules);
+    check(result.new_notifications.size() == 1 && engine.active_notification_id(id) == 1,
+          "New queue evaluates through indexed rules");
+    check(result.new_notifications[0].close_reason == CloseReason::Active &&
+          result.new_notifications[0].trigger == Trigger::Event &&
+          result.new_notifications[0].rule_type == RuleKind::Backlog,
+          "Lifecycle values must be typed");
+}
+
+// Compaction protects active evidence and stable IDs; later recovery uses the ID index.
+void retention_preserves_active_episodes_and_ids() {
+    RuleCollection rules;
+    rules.create(BacklogRule{"billing", 20});
+    NotificationEngine engine;
+    for (int index = 0; index < 3; ++index) {
+        engine.process_validated(snapshot("open-" + std::to_string(index), index * 2 + 1, 23), rules);
+        engine.process_validated(snapshot("close-" + std::to_string(index), index * 2 + 2, 0), rules);
+    }
+    engine.process_validated(snapshot("active", 7, 23), rules);
+    engine.compact(0, 0);
+    check(engine.notifications().size() == 1 && engine.notifications()[0].id == 4,
+          "Active notification survives even zero retention target");
+    check(engine.active_notification_id(1) == 4, "Stable ID remains linked");
+    engine.process_validated(snapshot("recovery", 8, 0), rules);
+    check(engine.notifications()[0].close_reason == CloseReason::Recovered,
+          "Recovery works when vector index is no longer ID minus one");
+    const auto next = engine.process_validated(snapshot("next", 9, 23), rules);
+    check(next.new_notifications[0].id == 5, "IDs must not be reused after pruning");
+    check(engine.process_validated(snapshot("open-0", 1, 23), rules).outcome == SnapshotOutcome::Stale,
+          "Evicted old event returns stale, cannot reopen current episode");
+}
 } // namespace
 
 int main() {
@@ -268,6 +305,8 @@ int main() {
         {"invalid rule input", invalid_rules_do_not_consume_events},
         {"notification context preserves evidence", context_is_captured_without_changing_suppression},
         {"optional context validation", optional_context_validation},
+        {"indexed custom queue path", indexed_path_accepts_registered_queue},
+        {"retention protects IDs and active evidence", retention_preserves_active_episodes_and_ids},
     };
     int failures = 0;
     for (const auto& [name, run] : tests) {

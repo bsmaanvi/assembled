@@ -1,5 +1,7 @@
 """Real HTTP/persistence tests; every test uses its own temporary state file."""
 import json
+import os
+from datetime import datetime, timezone
 from pathlib import Path
 import socket
 import subprocess
@@ -312,6 +314,206 @@ class WebApiTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('context disagrees', result.stderr)
         self.assertEqual(self.path.read_text(), content)
+
+    # Duplicate create/edit attempts identify the existing rule without changing state.
+    def test_duplicate_rules_are_rejected(self):
+        id = self.rule()
+        self.request(f'/api/rules/{id}', 'PATCH', {'enabled': False})
+        before = self.view()
+        conflict = self.request('/api/rules', 'POST', {'type': 'backlog', 'queue_id': 'billing', 'threshold': 20}, status=409)
+        self.assertEqual(conflict['existing_rule_id'], id)
+        self.assertEqual(self.view(), before)
+        second = self.rule(threshold=30)
+        self.request(f'/api/rules/{second}', 'PATCH', {'type': 'backlog', 'queue_id': 'billing', 'threshold': 20}, status=409)
+        self.assertEqual(self.view()['rules'][1]['threshold'], 30)
+        self.assertEqual(second, 2)
+        self.request(f'/api/rules/{id}', 'PATCH', {'type': 'backlog', 'queue_id': 'billing', 'threshold': 20})
+
+    # Register a queue, configure it, process an event, and restore all of it after restart.
+    def test_custom_queue_lifecycle(self):
+        self.event('unknown-first', queue='refunds', status=400)
+        self.request('/api/queues', 'POST', {'id': 'refunds', 'name': 'Refunds'}, status=201)
+        self.assertEqual(len(self.view()['queues']), 4)
+        id = self.rule(queue='refunds')
+        self.assertEqual(self.view()['rules'][0]['status'], 'waiting_for_data')
+        self.event('unknown-first', queue='refunds')
+        before = self.view()
+        self.assertEqual(before['active_alerts'][0]['id'], id)
+        self.assertEqual(before['queues'][-1]['snapshot']['tickets_waiting'], 23)
+        self.stop()
+        self.start()
+        self.assertEqual(self.view(), before)
+        self.assertEqual(self.event('unknown-first', queue='refunds')['outcome'], 'duplicate')
+
+    # Invalid/duplicate catalog entries cannot mutate or replace existing queues.
+    def test_queue_validation(self):
+        before = self.view()
+        for id, name in [('Bad ID', 'Name'), ('valid', ''), ('valid', '   '), ('a'*65, 'Name'), ('x', 'bad\nname')]:
+            self.request('/api/queues', 'POST', {'id': id, 'name': name}, status=400)
+        self.request('/api/queues', 'POST', {'id': 'billing', 'name': 'Replacement'}, status=409)
+        self.assertEqual(self.view(), before)
+
+    # Schema-1 state upgrades on save while preserving old duplicates and observations.
+    def test_schema_one_migration_preserves_rules(self):
+        self.rule()
+        self.stop()
+        saved = json.loads(self.path.read_text())
+        saved['schema_version'] = 1
+        saved.pop('queues')
+        saved['engine'].pop('next_notification_id', None)
+        duplicate = {**saved['rules'][0], 'id': 2}
+        saved['rules'].append(duplicate)
+        self.path.write_text(json.dumps(saved))
+        self.start()
+        self.assertEqual(len(self.view()['rules']), 2)
+        self.request('/api/rules', 'POST', {'type': 'backlog', 'queue_id': 'billing', 'threshold': 20}, status=409)
+        self.request('/api/queues', 'POST', {'id': 'refunds', 'name': 'Refunds'}, status=201)
+        self.assertEqual(json.loads(self.path.read_text())['schema_version'], 2)
+        self.assertEqual(len(self.view()['rules']), 2)
+
+    # Sparse notification IDs, active context, and deduplication survive cleanup/restart.
+    def test_retention_compaction_preserves_active_state(self):
+        self.rule()
+        self.event('open-1', time=1)
+        self.event('clear-1', time=2, waiting=0)
+        self.event('open-2', time=3)
+        self.event('clear-2', time=4, waiting=0)
+        self.event('open-3', time=5)
+        self.request('/api/maintenance/compact', 'POST', {'history_limit': 0, 'event_limit': 0})
+        view = self.view()
+        self.assertEqual([n['id'] for n in view['notifications']], [3])
+        self.assertEqual(view['active_alerts'][0]['notification_id'], 3)
+        self.stop()
+        self.start()
+        self.assertEqual(self.view(), view)
+        self.assertEqual(self.event('open-3', time=5)['outcome'], 'duplicate')
+        self.assertEqual(self.event('open-1', time=1)['outcome'], 'stale')
+        self.event('clear-3', time=6, waiting=0)
+        self.assertEqual(self.view()['notifications'][0]['close_reason'], 'recovered')
+        self.event('open-4', time=7)
+        self.assertEqual(self.view()['notifications'][-1]['id'], 4)
+        self.assertEqual(self.view()['active_alerts'][0]['notification_id'], 4)
+
+    # Cleanup retains all equal-watermark events, preventing replay from undoing tie order.
+    def test_retention_protects_equal_timestamp_events(self):
+        self.rule()
+        self.event('first-clear', time=100, waiting=0)
+        self.event('second-open', time=100, waiting=23)
+        self.request('/api/maintenance/compact', 'POST', {'history_limit': 0, 'event_limit': 0})
+        self.assertEqual(self.event('first-clear', time=100, waiting=0)['outcome'], 'duplicate')
+        self.assertEqual(len(self.view()['active_alerts']), 1)
+
+    # Invalid retention targets are rejected before any record can be removed.
+    def test_invalid_retention_request_is_atomic(self):
+        self.rule()
+        self.event('first')
+        before = self.view()
+        self.request('/api/maintenance/compact', 'POST', {'history_limit': -1}, status=400)
+        self.request('/api/maintenance/compact', 'POST', {'event_limit': 1.5}, status=400)
+        self.assertEqual(self.view(), before)
+
+    def supplied_events(self):
+        path = os.environ.get('INTRADAY_EVENTS_FILE')
+        if not path:
+            self.skipTest('Set INTRADAY_EVENTS_FILE to the supplied assignment events.jsonl')
+        text = Path(path).read_text()
+        rows = [json.loads(line) for line in text.splitlines() if line.strip()]
+        self.assertEqual(len(rows), 96, 'This regression expects the reviewed assignment fixture')
+        return text, [event for event in rows if event['type'] == 'queue_snapshot']
+
+    def reference_episodes(self, events, rules):
+        # Independent reference: small Python state machine, no C++ engine calls.
+        active, history, latest = {}, [], {}
+        for event in sorted(events, key=lambda event: event['ts']):
+            latest[event['queue_id']] = event
+            for rule in rules:
+                if rule['queue_id'] != event['queue_id']:
+                    continue
+                value = event['tickets_waiting'] if rule['type'] == 'backlog' else event['longest_wait_sec']
+                threshold = 20 if rule['type'] == 'backlog' else event['sla_target_sec']
+                id = rule['id']
+                if value > threshold and id not in active:
+                    record = {'rule_id': id, 'event_id': event['event_id'], 'queue_id': event['queue_id'],
+                              'observed_value': value, 'threshold': threshold, 'close_reason': ''}
+                    history.append(record)
+                    active[id] = record
+                elif value <= threshold and id in active:
+                    active.pop(id)['close_reason'] = 'recovered'
+        return history, latest, active
+
+    # The supplied feed yields two recovered Billing episodes with independently checked evidence.
+    def test_supplied_assignment_billing_rules(self):
+        text, events = self.supplied_events()
+        rules = [dict(id=self.rule(), type='backlog', queue_id='billing'),
+                 dict(id=self.rule(kind='sla'), type='sla', queue_id='billing')]
+        expected, latest, active = self.reference_episodes(events, rules)
+        self.assertEqual(len(expected), 2)
+        result = self.request('/api/replay', 'POST', text, raw=True)
+        self.assertEqual(result, {'processed': 24, 'duplicates': 0, 'stale': 0,
+                                 'skipped_agent_events': 72, 'notifications_created': 2})
+        view = self.view()
+        for actual, wanted in zip(view['notifications'], expected):
+            for key, value in wanted.items():
+                self.assertEqual(actual[key], value)
+        self.assertEqual(len(view['notifications']), len(expected))
+        self.assertEqual(active, {})
+        self.assertEqual(view['active_alerts'], [])
+        self.assertEqual(view['notifications'][0]['event_id'], 'evt_01HXYZ039')
+        self.assertEqual(view['notifications'][1]['event_id'], 'evt_01HXYZ049')
+        for queue in view['queues']:
+            snapshot = queue['snapshot']
+            original = latest[queue['id']]
+            for field in ('tickets_waiting', 'longest_wait_sec', 'sla_target_sec', 'agents_available',
+                          'agents_on_call', 'volume_last_15m', 'volume_forecast_next_15m'):
+                self.assertEqual(snapshot[field], original.get(field))
+        self.stop()
+        self.start()
+        self.assertEqual(self.view(), view)
+        retry = self.request('/api/replay', 'POST', text, raw=True)
+        self.assertEqual(retry['duplicates'], 24)
+        self.assertEqual(retry['notifications_created'], 0)
+        self.assertEqual(self.view(), view)
+
+    # All-queue replay produces three recovered episodes; pruning/restart never re-alerts old data.
+    def test_supplied_assignment_all_queues_and_retention(self):
+        text, events = self.supplied_events()
+        rules = []
+        for queue in ('billing', 'tier_2', 'vip'):
+            for kind in ('backlog', 'sla'):
+                rules.append(dict(id=self.rule(kind=kind, queue=queue), type=kind, queue_id=queue))
+        expected, _, _ = self.reference_episodes(events, rules)
+        self.assertEqual(len(expected), 3)
+        result = self.request('/api/replay', 'POST', text, raw=True)
+        self.assertEqual(result['notifications_created'], 3)
+        for actual, wanted in zip(self.view()['notifications'], expected):
+            for key, value in wanted.items():
+                self.assertEqual(actual[key], value)
+        self.request('/api/maintenance/compact', 'POST', {'history_limit': 1, 'event_limit': 0})
+        before = self.view()
+        self.assertEqual([notification['id'] for notification in before['notifications']], [3])
+        self.stop()
+        self.start()
+        self.assertEqual(self.view(), before)
+        retry = self.request('/api/replay', 'POST', text, raw=True)
+        self.assertEqual(retry['notifications_created'], 0)
+        self.assertEqual(retry['processed'], 0)
+        self.assertEqual(retry['duplicates'] + retry['stale'], 24)
+        self.assertEqual(self.view(), before)
+
+    # In original arrival order the late VIP snapshot is stale; batch import instead sorts it.
+    def test_supplied_assignment_original_arrival_order(self):
+        _, events = self.supplied_events()
+        self.rule()
+        self.rule(kind='sla')
+        outcomes = []
+        for event in events:
+            outcomes.append(self.request('/api/events', 'POST', event)['outcome'])
+        self.assertEqual(outcomes.count('processed'), 23)
+        self.assertEqual(outcomes.count('stale'), 1)
+        view = self.view()
+        self.assertEqual(len(view['notifications']), 2)
+        self.assertEqual(view['active_alerts'], [])
+        self.assertEqual(view['queues'][2]['snapshot']['event_id'], 'evt_01HXYZ093')
 
 
 if __name__ == '__main__':

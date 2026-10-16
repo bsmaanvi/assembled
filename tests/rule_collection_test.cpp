@@ -208,6 +208,46 @@ void candidate_changes_do_not_mutate_original() {
           backlog(original).tickets_waiting_threshold == 20,
           "A proposed copy must not change the original before commit");
 }
+// Equivalent definitions conflict even when the existing rule is disabled.
+void prevents_duplicate_configurations() {
+    RuleCollection collection;
+    const int first = collection.create(BacklogRule{"billing", 20});
+    collection.set_enabled(first, false);
+    try {
+        collection.create(BacklogRule{"billing", 20});
+        throw std::runtime_error("Expected conflict");
+    } catch (const DomainError& error) {
+        check(error.code == ErrorCode::Conflict && error.existing_rule_id == first,
+              "Conflict must identify the existing rule");
+    }
+    check(collection.create(BacklogRule{"billing", 30}) == 2, "Conflict must not consume ID");
+    expect_throw<DomainError>([&] { collection.edit(2, BacklogRule{"billing", 20}); });
+    check(backlog(collection, 1).tickets_waiting_threshold == 30, "Rejected edit leaves definition unchanged");
+    collection.edit(first, BacklogRule{"billing", 20}); // No-op on itself is allowed.
+}
+
+// Queue registration is shared by definition validation and queue-to-rule indexing.
+void catalog_and_indexes_follow_configuration() {
+    RuleCollection collection;
+    collection.add_queue({"refunds", "Refunds"});
+    const int id = collection.create(BacklogRule{"refunds", 10});
+    check(collection.catalog().contains("refunds"), "New catalog queue exists");
+    check(collection.for_queue("refunds") == std::vector<int>{id}, "Index includes new rule");
+    collection.edit(id, BacklogRule{"billing", 10});
+    check(collection.for_queue("refunds").empty() && collection.for_queue("billing") == std::vector<int>{id},
+          "Changing queue updates index");
+    expect_throw<DomainError>([&] { collection.add_queue({"refunds", "Duplicate"}); });
+    expect_throw<DomainError>([&] { collection.add_queue({"Bad ID", "Invalid"}); });
+    expect_throw<DomainError>([&] { collection.add_queue({"valid", "   "}); });
+}
+
+// Legacy saved duplicates load intact, but new equivalent rules remain prohibited.
+void preserves_legacy_duplicate_rules() {
+    RuleCollection collection({{1, true, BacklogRule{"billing", 20}},
+                               {2, false, BacklogRule{"billing", 20}}});
+    check(collection.rules().size() == 2, "Restoring must not silently delete legacy rules");
+    expect_throw<DomainError>([&] { collection.create(BacklogRule{"billing", 20}); });
+}
 } // namespace
 
 int main() {
@@ -226,6 +266,9 @@ int main() {
         {"rejects invalid initial collections", rejects_invalid_initial_collections},
         {"prevents ID overflow", prevents_id_overflow},
         {"candidate copy is isolated", candidate_changes_do_not_mutate_original},
+        {"equivalent rules conflict", prevents_duplicate_configurations},
+        {"catalog and indexes follow configuration", catalog_and_indexes_follow_configuration},
+        {"legacy duplicate rules preserved", preserves_legacy_duplicate_rules},
     };
     int failures = 0;
     for (const auto& [name, run] : tests) {

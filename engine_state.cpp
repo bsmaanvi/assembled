@@ -10,7 +10,8 @@
 namespace intraday {
 std::string NotificationEngine::export_state() const {
     Json result{{"events", Json::array()}, {"latest", Json::array()},
-                {"notifications", Json::array()}, {"rule_states", Json::array()}};
+                {"notifications", Json::array()}, {"rule_states", Json::array()},
+                {"next_notification_id", next_notification_id_}};
     for (const auto& [id, event] : events_) {
         (void)id;
         result["events"].push_back(snapshot_json(event));
@@ -28,7 +29,7 @@ std::string NotificationEngine::export_state() const {
 }
 
 NotificationEngine NotificationEngine::restore(const std::string& text,
-                                               const std::vector<QueueRule>& rules) {
+                                               const std::vector<QueueRule>& rules, const QueueCatalog& catalog) {
     const auto saved = Json::parse(text);
     NotificationEngine engine;
     for (const auto& key : {"events", "latest", "notifications", "rule_states"})
@@ -37,7 +38,7 @@ NotificationEngine NotificationEngine::restore(const std::string& text,
         const auto event = snapshot_from_json(value);
         // Reuse validation without trusting persisted event fields.
         NotificationEngine validation;
-        validation.process(event, {});
+        validation.process_validated(event, RuleCollection({}, catalog));
         if (!engine.events_.emplace(event.event_id, event).second)
             throw std::runtime_error("Duplicate event in saved state.");
     }
@@ -63,9 +64,9 @@ NotificationEngine NotificationEngine::restore(const std::string& text,
             integer(value.at("observed_at_sec"), "observation time", 0, 253402300799LL),
             static_cast<int>(integer(value.at("observed_value"), "observed value")),
             static_cast<int>(integer(value.at("threshold"), "threshold")),
-            value.at("explanation").get<std::string>(), value.at("close_reason").get<std::string>(),
-            value.at("trigger").get<std::string>(), value.at("rule_type").get<std::string>()};
-        if (notification.id != engine.notifications_.size() + 1 ||
+            value.at("explanation").get<std::string>(), close_reason_from_name(value.at("close_reason").get<std::string>()),
+            trigger_from_name(value.at("trigger").get<std::string>()), rule_kind_from_name(value.at("rule_type").get<std::string>())};
+        if ((!engine.notifications_.empty() && notification.id <= engine.notifications_.back().id) ||
             !engine.events_.contains(notification.event_id) ||
             engine.events_.at(notification.event_id).queue_id != notification.queue_id ||
             engine.events_.at(notification.event_id).observed_at_sec != notification.observed_at_sec ||
@@ -78,15 +79,11 @@ NotificationEngine NotificationEngine::restore(const std::string& text,
             ? snapshot_from_json(value.at("context")) : event;
         if (*notification.context != event)
             throw std::runtime_error("Notification context disagrees with its source event.");
-        if ((notification.rule_type != "backlog" && notification.rule_type != "sla") ||
-            (notification.trigger != "event" && notification.trigger != "rule_change") ||
-            (notification.close_reason != "" && notification.close_reason != "recovered" &&
-             notification.close_reason != "rule_changed" && notification.close_reason != "rule_disabled" &&
-             notification.close_reason != "rule_removed") ||
-            notification.observed_value != (notification.rule_type == "sla" ? event.longest_wait_sec : event.tickets_waiting) ||
-            (notification.rule_type == "sla" && notification.threshold != event.sla_target_sec) ||
+        if (notification.observed_value != (notification.rule_type == RuleKind::Sla ? event.longest_wait_sec : event.tickets_waiting) ||
+            (notification.rule_type == RuleKind::Sla && notification.threshold != event.sla_target_sec) ||
             notification.observed_value <= notification.threshold)
             throw std::runtime_error("Invalid notification evidence in saved state.");
+        engine.notification_positions_[notification.id] = engine.notifications_.size();
         engine.notifications_.push_back(std::move(notification));
     }
     std::set<std::size_t> active_notifications;
@@ -97,7 +94,7 @@ NotificationEngine NotificationEngine::restore(const std::string& text,
         const auto found = std::find_if(rules.begin(), rules.end(), [&](const auto& current) { return current == rule; });
         if (found == rules.end() || integer(value.at("id"), "rule ID", 1) != rule.id ||
             (!firing && notification_id != 0) ||
-            (firing && (!rule.enabled || notification_id == 0 || notification_id > engine.notifications_.size())))
+            (firing && (!rule.enabled || notification_id == 0 || !engine.notification_positions_.contains(notification_id))))
             throw std::runtime_error("Invalid rule episode in saved state.");
         const auto& queue = std::visit([](const auto& definition) -> const std::string& {
             return definition.queue_id;
@@ -110,9 +107,9 @@ NotificationEngine NotificationEngine::restore(const std::string& text,
         if (firing != expected_firing)
             throw std::runtime_error("Saved episode disagrees with current rule and observation.");
         if (firing) {
-            const auto& notification = engine.notifications_[notification_id - 1];
+            const auto& notification = engine.notifications_.at(engine.notification_positions_.at(notification_id));
             if (notification.rule_id != rule.id || notification.queue_id != queue ||
-                notification.rule_type != (backlog ? "backlog" : "sla") || !notification.close_reason.empty() ||
+                notification.rule_type != (backlog ? RuleKind::Backlog : RuleKind::Sla) || notification.close_reason != CloseReason::Active ||
                 !active_notifications.insert(notification_id).second)
                 throw std::runtime_error("Invalid active notification in saved state.");
         }
@@ -120,8 +117,14 @@ NotificationEngine NotificationEngine::restore(const std::string& text,
             throw std::runtime_error("Duplicate rule episode in saved state.");
     }
     for (const auto& notification : engine.notifications_)
-        if (notification.close_reason.empty() && !active_notifications.contains(notification.id))
+        if (notification.close_reason == CloseReason::Active && !active_notifications.contains(notification.id))
             throw std::runtime_error("Active notification has no saved episode.");
+    const auto minimum_next = engine.notifications_.empty() ? 1 : engine.notifications_.back().id + 1;
+    engine.next_notification_id_ = saved.contains("next_notification_id")
+        ? static_cast<std::size_t>(integer(saved.at("next_notification_id"), "next notification ID", 1))
+        : minimum_next;
+    if (engine.next_notification_id_ < minimum_next)
+        throw std::runtime_error("Invalid next notification ID.");
     return engine;
 }
 } // namespace intraday

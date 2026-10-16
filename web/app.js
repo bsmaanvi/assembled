@@ -1,7 +1,8 @@
 'use strict';
 
 const $ = id => document.getElementById(id);
-const names = { billing: 'Billing', tier_2: 'Tier 2 support', vip: 'VIP' };
+let names = {};
+let catalogSignature = "";
 const statusLabels = { firing: 'Active violation', clear: 'Clear', disabled: 'Disabled', waiting_for_data: 'Waiting for data' };
 let currentState = null;
 let lastNotification = null;
@@ -55,6 +56,21 @@ function emptyState(title, detail) {
 function ruleText(rule) {
   return rule.type === 'backlog' ? `More than ${rule.threshold} tickets waiting` : 'Oldest wait exceeds the queue SLA target';
 }
+function renderCatalog(state) {
+  names = Object.fromEntries(state.queues.map(queue => [queue.id, queue.name]));
+  const signature = JSON.stringify(names);
+  $('queue-count').textContent = `${state.queues.length} queues`;
+  if (signature === catalogSignature) return;
+  const selected = $('queue-select').value;
+  $('queue-select').replaceChildren();
+  for (const queue of state.queues) {
+    const option = element('option', '', queue.name);
+    option.value = queue.id;
+    $('queue-select').append(option);
+  }
+  if (state.queues.some(queue => queue.id === selected)) $('queue-select').value = selected;
+  catalogSignature = signature;
+}
 function renderQueues(state) {
   $('queue-rows').replaceChildren();
   const observed = state.queues.filter(queue => queue.snapshot);
@@ -66,7 +82,7 @@ function renderQueues(state) {
   $('stat-rules').textContent = state.rules.filter(rule => rule.enabled).length;
   for (const queue of state.queues) {
     const row = element('tr', 'queue-metric-row'), title = element('td'), name = element('div', 'queue-name');
-    name.append(element('span', 'queue-icon', queue.id === 'billing' ? 'B' : queue.id === 'vip' ? 'V' : 'T'), document.createTextNode(queue.name));
+    name.append(element('span', 'queue-icon', queue.name.slice(0, 1).toUpperCase()), document.createTextNode(queue.name));
     title.append(name, element('small', 'observation', queue.snapshot ? timeLabel(queue.snapshot.observed_at_sec) : 'Waiting for first observation'));
     row.append(title);
     const snapshot = queue.snapshot;
@@ -138,7 +154,7 @@ function renderHistory(state) {
     row.append(element('span', 'history-symbol', notification.severity === 'critical' ? '!' : '+'), body, meta);
     $('history').append(row);
   }
-  if (state.notifications.length > 30) $('history').append(element('div', 'panel-foot', 'Showing the latest 30 notifications. Full history is retained by the backend.'));
+  if (state.notifications.length > 30) $('history').append(element('div', 'panel-foot', 'Showing the latest 30 notifications. Other retained history is available from the backend; explicit cleanup may remove older entries.'));
 }
 function renderRules(state) {
   $('rule-list').replaceChildren();
@@ -178,7 +194,7 @@ async function refresh() {
     const state = await api('/api/state');
     if (version !== refreshVersion) return;
     currentState = state;
-    renderQueues(state); renderAlerts(state); renderHistory(state); renderRules(state); updatePreview();
+    renderCatalog(state); renderQueues(state); renderAlerts(state); renderHistory(state); renderRules(state); updatePreview();
     const maximum = state.notifications.at(-1)?.id || 0;
     // Initial load does not replay old notifications as new toasts.
     if (lastNotification !== null && maximum >= lastNotification) {
@@ -196,7 +212,8 @@ function updatePreview() {
   $('threshold-field').hidden = sla; $('threshold').required = !sla; $('sla-context').hidden = !sla;
   const snapshot = currentState?.queues.find(queue => queue.id === $('queue-select').value)?.snapshot;
   $('sla-context').textContent = snapshot ? `Latest queue SLA target: ${duration(snapshot.sla_target_sec)}. This rule follows the feed's target.` : 'The SLA target comes from queue observations. Waiting for the first snapshot.';
-  $('rule-preview').textContent = sla ? `Notify me when ${names[$('queue-select').value]}'s oldest ticket wait exceeds its SLA target.` : `Notify me when ${names[$('queue-select').value]} has more than ${threshold || '…'} tickets waiting.`;
+  const queueName = names[$('queue-select').value] || 'the selected queue';
+  $('rule-preview').textContent = sla ? `Notify me when ${queueName}'s oldest ticket wait exceeds its SLA target.` : `Notify me when ${queueName} has more than ${threshold || '…'} tickets waiting.`;
 }
 function resetForm() {
   $('rule-form').reset(); $('rule-id').value = ''; $('form-title').textContent = 'Create a rule';
@@ -222,6 +239,27 @@ function route() {
   $('nav-rules').setAttribute('aria-current', rules ? 'page' : 'false');
   $('breadcrumb').textContent = rules ? 'Notification rules' : 'Overview';
 }
+$('queue-form').addEventListener('submit', event => {
+  event.preventDefault();
+  const body = { id: $('new-queue-id').value.trim(), name: $('new-queue-name').value.trim() };
+  runAction(async () => {
+    await api('/api/queues', 'POST', body);
+    await refresh();
+    $('queue-select').value = body.id;
+    $('queue-form').reset(); updatePreview();
+    showFeedback(`Queue ${body.name} added. It will wait for its first observation.`);
+  });
+});
+$('retention-form').addEventListener('submit', event => {
+  event.preventDefault();
+  if (!window.confirm('Remove older unprotected history and event IDs? Active alerts and their evidence will be retained.')) return;
+  runAction(async () => {
+    const result = await api('/api/maintenance/compact', 'POST', {
+      history_limit: Number($('history-limit').value), event_limit: Number($('event-limit').value),
+    });
+    showFeedback(`Cleanup saved. ${result.retained_notifications} notifications retained, including all active alerts.`);
+  });
+});
 $('rule-form').addEventListener('submit', event => {
   event.preventDefault();
   const body = { queue_id: $('queue-select').value, type: $('rule-type').value, enabled: $('rule-enabled').checked };

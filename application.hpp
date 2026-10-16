@@ -15,6 +15,8 @@ public:
     explicit Application(std::filesystem::path path);
     Json view() const;
     Json create_rule(const Json& input);
+    Json create_queue(const Json& input);
+    Json compact(const Json& input);
     Json update_rule(int id, const Json& input);
     Json ingest(const Json& input);
     Json replay(const std::string& jsonl);

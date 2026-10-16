@@ -71,11 +71,18 @@ int main(int argc, char** argv) {
             } catch (const nlohmann::json::exception&) {
                 response.status = 400;
                 response.set_content("{\"error\":\"Invalid JSON or missing/incorrect fields.\"}", "application/json");
+            } catch (const intraday::DomainError& error) {
+                switch (error.code) {
+                    case intraday::ErrorCode::InvalidInput: response.status = 400; break;
+                    case intraday::ErrorCode::NotFound: response.status = 404; break;
+                    case intraday::ErrorCode::Conflict: response.status = 409; break;
+                }
+                intraday::Json body{{"error", error.what()}};
+                if (error.existing_rule_id > 0) body["existing_rule_id"] = error.existing_rule_id;
+                response.set_content(body.dump(), "application/json");
             } catch (const std::invalid_argument& error) {
-                const std::string message = error.what();
-                response.status = message == "No rule with that ID." ? 404 :
-                    message.starts_with("Event ID was already used") ? 409 : 400;
-                response.set_content(intraday::Json{{"error", message}}.dump(), "application/json");
+                response.status = 400;
+                response.set_content(intraday::Json{{"error", error.what()}}.dump(), "application/json");
             } catch (const std::exception& error) {
                 std::cerr << "Request failed: " << error.what() << '\n';
                 response.status = 500;
@@ -104,6 +111,16 @@ int main(int argc, char** argv) {
                     throw std::invalid_argument("Invalid rule ID.");
                 return app.update_rule(id, intraday::Json::parse(request.body));
             });
+        });
+        server.Post("/api/queues", [&](const auto& request, auto& response) {
+            respond(request, response, [&] {
+                const auto result = app.create_queue(intraday::Json::parse(request.body));
+                response.status = 201;
+                return result;
+            });
+        });
+        server.Post("/api/maintenance/compact", [&](const auto& request, auto& response) {
+            respond(request, response, [&] { return app.compact(intraday::Json::parse(request.body)); });
         });
         server.Post("/api/events", [&](const auto& request, auto& response) {
             respond(request, response, [&] { return app.ingest(intraday::Json::parse(request.body)); });

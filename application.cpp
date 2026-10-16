@@ -4,6 +4,8 @@
 #include <cerrno>
 #include <cstring>
 #include <fstream>
+#include <fcntl.h>
+#include <iostream>
 #include <iterator>
 #include <stdexcept>
 #include <tuple>
@@ -34,7 +36,9 @@ Json result_json(const SnapshotResult& result) {
 Json Application::encode(const State& state) {
     Json rules = Json::array();
     for (const auto& rule : state.rules.rules()) rules.push_back(rule_json(rule));
-    return {{"schema_version", 1}, {"rules", rules}, {"demo_cursor", state.demo_cursor},
+    Json queues = Json::array();
+    for (const auto& queue : state.rules.catalog().queues()) queues.push_back({{"id", queue.id}, {"name", queue.name}});
+    return {{"schema_version", 2}, {"queues", queues}, {"rules", rules}, {"demo_cursor", state.demo_cursor},
             {"engine", Json::parse(state.engine.export_state())}};
 }
 // checks for an existing file and if it exists parses and validates the json and restores 
@@ -48,13 +52,23 @@ Application::Application(std::filesystem::path path) : path_(std::move(path)) {
     std::ifstream input(path_);
     if (!input) throw std::runtime_error("Cannot read state file; it was left unchanged.");
     const auto saved = Json::parse(input);
-    if (saved.at("schema_version") != 1 || !saved.at("rules").is_array())
+    if ((saved.at("schema_version") != 1 && saved.at("schema_version") != 2) || !saved.at("rules").is_array())
         throw std::runtime_error("Unsupported state format; it was left unchanged.");
+    if (saved.at("schema_version") == 2 && !saved.at("engine").contains("next_notification_id"))
+        throw std::runtime_error("Missing next notification ID in schema-2 state.");
     std::vector<QueueRule> rules;
     for (const auto& value : saved.at("rules")) rules.push_back(rule_from_json(value));
-    state_.rules = RuleCollection(std::move(rules));
+    QueueCatalog catalog;
+    if (saved.at("schema_version") == 2) {
+        if (!saved.at("queues").is_array()) throw std::runtime_error("Invalid queue catalog.");
+        std::vector<Queue> queues;
+        for (const auto& value : saved.at("queues"))
+            queues.push_back({value.at("id").get<std::string>(), value.at("name").get<std::string>()});
+        catalog = QueueCatalog(std::move(queues));
+    }
+    state_.rules = RuleCollection(std::move(rules), std::move(catalog));
     state_.demo_cursor = integer(saved.at("demo_cursor"), "demo cursor");
-    state_.engine = NotificationEngine::restore(saved.at("engine").dump(), state_.rules.rules());
+    state_.engine = NotificationEngine::restore(saved.at("engine").dump(), state_.rules.rules(), state_.rules.catalog());
 }
 
 // write the complete proposed state to a temporary file, flush it, and atomically replace the snapshot before 
@@ -63,6 +77,7 @@ void Application::commit(State candidate) {
     const std::string payload = encode(candidate).dump(2) + "\n";
     if (payload.size() > 32 * 1024 * 1024)
         throw std::runtime_error("Demo state reached 32 MiB. Archive it before continuing.");
+    const auto parent = path_.has_parent_path() ? path_.parent_path() : std::filesystem::path(".");
     std::string pattern = path_.string() + ".tmp.XXXXXX";
     int fd = ::mkstemp(pattern.data());
     if (fd == -1) throw std::runtime_error("Cannot create temporary state file.");
@@ -79,6 +94,13 @@ void Application::commit(State candidate) {
         fd = -1;
         if (closed != 0) throw std::runtime_error("Cannot close state file.");
         std::filesystem::rename(pattern, path_);
+        // Once rename succeeds the commit is published on disk. Do not report
+        // rollback for a later directory-sync failure; log the durability limit.
+        const int directory = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY);
+        if (directory != -1) {
+            if (::fsync(directory) != 0) std::cerr << "Warning: state directory sync failed.\n";
+            ::close(directory);
+        } else std::cerr << "Warning: state directory could not be synced.\n";
     } catch (...) {
         if (fd != -1) ::close(fd);
         std::error_code ignored;
@@ -93,10 +115,10 @@ Json Application::view() const {
     // locks the mutex to stop changes
     const std::lock_guard lock(mutex_);
     Json queues = Json::array(), rules = Json::array(), alerts = Json::array(), notifications = Json::array();
-    const auto active = state_.engine.active_rule_ids();
-    for (const auto& [id, name] : std::vector<std::pair<std::string, std::string>>{
-            {"billing", "Billing"}, {"tier_2", "Tier 2 support"}, {"vip", "VIP"}}) {
-        Json queue{{"id", id}, {"name", name}, {"snapshot", nullptr}};
+
+    for (const auto& catalog_queue : state_.rules.catalog().queues()) {
+        const auto& id = catalog_queue.id;
+        Json queue{{"id", id}, {"name", catalog_queue.name}, {"snapshot", nullptr}};
         if (const auto found = state_.engine.latest_snapshots().find(id); found != state_.engine.latest_snapshots().end())
             queue["snapshot"] = snapshot_json(found->second);
         queues.push_back(queue);
@@ -105,7 +127,7 @@ Json Application::view() const {
         auto encoded = rule_json(rule);
         encoded["status"] = !rule.enabled ? "disabled" :
             !state_.engine.latest_snapshots().contains(queue_of(rule)) ? "waiting_for_data" :
-            std::find(active.begin(), active.end(), rule.id) != active.end() ? "firing" : "clear";
+            state_.engine.active_notification_id(rule.id) != 0 ? "firing" : "clear";
         rules.push_back(encoded);
         if (encoded["status"] == "firing") {
             const auto& snapshot = state_.engine.latest_snapshots().at(queue_of(rule));
@@ -115,12 +137,7 @@ Json Application::view() const {
             encoded["threshold"] = backlog ? std::get<BacklogRule>(rule.definition).tickets_waiting_threshold : snapshot.sla_target_sec;
             encoded["observed_at_sec"] = snapshot.observed_at_sec;
             encoded["context"] = snapshot_json(snapshot);
-            for (auto notification = state_.engine.notifications().rbegin(); notification != state_.engine.notifications().rend(); ++notification) {
-                if (notification->rule_id == rule.id && notification->close_reason.empty()) {
-                    encoded["notification_id"] = notification->id;
-                    break;
-                }
-            }
+            encoded["notification_id"] = state_.engine.active_notification_id(rule.id);
             alerts.push_back(encoded);
         }
     }
@@ -131,7 +148,7 @@ Json Application::view() const {
     for (const auto& notification : state_.engine.notifications()) {
         auto encoded = notification_json(notification);
         // Preserve the original rule type even if its configuration later changes.
-        encoded["severity"] = notification.rule_type == "sla" ? "critical" : "warning";
+        encoded["severity"] = notification.rule_type == RuleKind::Sla ? "critical" : "warning";
         notifications.push_back(encoded);
     }
     return {{"queues", queues}, {"rules", rules}, {"active_alerts", alerts},
@@ -141,13 +158,38 @@ Json Application::view() const {
 // It combines latest observations, derived rule statuses, prioritized active episodes, 
 // and original notification history. The frontend renders those decisions rather than evaluating rules itself.
 
+// Explicit catalog registration; observations cannot silently create queues.
+Json Application::create_queue(const Json& input) {
+    const std::lock_guard lock(mutex_);
+    auto candidate = state_;
+    Queue queue{input.at("id").get<std::string>(), input.at("name").get<std::string>()};
+    candidate.rules.add_queue(queue);
+    commit(std::move(candidate));
+    return {{"id", queue.id}, {"name", queue.name}};
+}
+
+// Retention is explicit so a routine save never silently deletes user history.
+Json Application::compact(const Json& input) {
+    const std::lock_guard lock(mutex_);
+    if (!input.is_object()) throw DomainError(ErrorCode::InvalidInput, "Retention settings must be an object.");
+    const auto history = input.contains("history_limit")
+        ? integer(input.at("history_limit"), "history_limit", 0, 10000) : 1000;
+    const auto events = input.contains("event_limit")
+        ? integer(input.at("event_limit"), "event_limit", 0, 100000) : 10000;
+    auto candidate = state_;
+    candidate.engine.compact(static_cast<std::size_t>(history), static_cast<std::size_t>(events));
+    const auto retained = candidate.engine.notifications().size();
+    commit(std::move(candidate));
+    return {{"retained_notifications", retained}, {"history_limit", history}, {"event_limit", events}};
+}
+
 // lead saves a new rule
 Json Application::create_rule(const Json& input) {
     const std::lock_guard lock(mutex_);
     auto candidate = state_;
     const int id = candidate.rules.create(definition_from_json(input));
     if (input.contains("enabled")) candidate.rules.set_enabled(id, input.at("enabled").get<bool>());
-    candidate.engine.reevaluate(id, candidate.rules.rules());
+    candidate.engine.reevaluate_validated(id, candidate.rules);
     commit(std::move(candidate));
     return {{"id", id}};
 }
@@ -156,11 +198,11 @@ Json Application::create_rule(const Json& input) {
 Json Application::update_rule(int id, const Json& input) {
     const std::lock_guard lock(mutex_);
     if (!input.is_object() || (!input.contains("type") && !input.contains("enabled")))
-        throw std::invalid_argument("Supply rule configuration or enabled state.");
+        throw DomainError(ErrorCode::InvalidInput, "Supply rule configuration or enabled state.");
     auto candidate = state_;
     if (input.contains("type")) candidate.rules.edit(id, definition_from_json(input));
     if (input.contains("enabled")) candidate.rules.set_enabled(id, input.at("enabled").get<bool>());
-    candidate.engine.reevaluate(id, candidate.rules.rules());
+    candidate.engine.reevaluate_validated(id, candidate.rules);
     commit(std::move(candidate));
     return {{"id", id}};
 }
@@ -169,7 +211,7 @@ Json Application::update_rule(int id, const Json& input) {
 Json Application::ingest(const Json& input) {
     const std::lock_guard lock(mutex_);
     auto candidate = state_;
-    const auto result = candidate.engine.process(snapshot_from_json(input), candidate.rules.rules());
+    const auto result = candidate.engine.process_validated(snapshot_from_json(input), candidate.rules);
     if (result.outcome != SnapshotOutcome::Duplicate) commit(std::move(candidate));
     return result_json(result);
 }
@@ -190,10 +232,10 @@ Json Application::replay(const std::string& jsonl) {
             if (type == "adherence_check" || type == "agent_state_change") { ++skipped; continue; }
             events.push_back(snapshot_from_json(value));
         } catch (const std::exception& error) {
-            throw std::invalid_argument("JSONL line " + std::to_string(line_number) + ": " + error.what());
+            throw DomainError(ErrorCode::InvalidInput, "JSONL line " + std::to_string(line_number) + ": " + error.what());
         }
     }
-    if (events.empty()) throw std::invalid_argument("No queue_snapshot events found.");
+    if (events.empty()) throw DomainError(ErrorCode::InvalidInput, "No queue_snapshot events found.");
     std::stable_sort(events.begin(), events.end(), [](const auto& a, const auto& b) {
         return a.observed_at_sec < b.observed_at_sec;
     });
@@ -201,7 +243,7 @@ Json Application::replay(const std::string& jsonl) {
     const auto before = candidate.engine.notifications().size();
     int processed = 0, duplicates = 0, stale = 0;
     for (const auto& event : events) {
-        const auto result = candidate.engine.process(event, candidate.rules.rules());
+        const auto result = candidate.engine.process_validated(event, candidate.rules);
         if (result.outcome == SnapshotOutcome::Processed) ++processed;
         if (result.outcome == SnapshotOutcome::Duplicate) ++duplicates;
         if (result.outcome == SnapshotOutcome::Stale) ++stale;
@@ -241,7 +283,7 @@ Json Application::next_demo() {
     snapshot.agents_on_call = waiting > 20 ? 12 : 10;
     snapshot.volume_last_15m = waiting > 20 ? 78 : 60;
     snapshot.volume_forecast_next_15m = 50;
-    const auto result = candidate.engine.process(snapshot, candidate.rules.rules());
+    const auto result = candidate.engine.process_validated(snapshot, candidate.rules);
     ++candidate.demo_cursor;
     commit(std::move(candidate));
     auto response = result_json(result);

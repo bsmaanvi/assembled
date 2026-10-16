@@ -104,8 +104,8 @@ inline Json notification_json(const Notification& value) {
     return {{"id", value.id}, {"rule_id", value.rule_id}, {"event_id", value.event_id},
             {"queue_id", value.queue_id}, {"observed_at_sec", value.observed_at_sec},
             {"observed_value", value.observed_value}, {"threshold", value.threshold},
-            {"explanation", value.explanation}, {"close_reason", value.close_reason},
-            {"trigger", value.trigger}, {"rule_type", value.rule_type},
+            {"explanation", value.explanation}, {"close_reason", name(value.close_reason)},
+            {"trigger", name(value.trigger)}, {"rule_type", name(value.rule_type)},
             {"context", value.context ? snapshot_json(*value.context) : Json(nullptr)}};
 }
 } // namespace intraday

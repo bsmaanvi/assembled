@@ -1,6 +1,6 @@
 # Intraday — queue notifications for team leads
 
-A C++20 backend with a small browser dashboard. Configure queue backlog and SLA
+A C++20 backend with a small browser dashboard and a configurable queue catalog. Configure queue backlog and SLA
 rules, replay observations, and see prioritized active violations, notification
 history, new-alert toasts, and staffing/volume context for each queue. No SQL or
 external service is required.
@@ -25,8 +25,8 @@ from the repository root so the `web` directory can be found.
 ```
 
 The JSON state file and its `.lock` file live in `data/` by default and are ignored
-by Git. Only one server process may use a state file. Existing terminal-prototype
-`rules.txt` files are separate and are never overwritten or automatically migrated.
+by Git. Only one server process may use a state file. Old terminal-prototype `rules.txt` files are not read or overwritten. The web
+server is now the only application entry point.
 Use a new state filename to begin a fresh demonstration.
 
 ## First product walkthrough
@@ -51,14 +51,17 @@ Use a new state filename to begin a fresh demonstration.
 
 The demo feed is explicitly synthetic, manually advanced, and persisted via its
 cursor. It is not a live production feed. Priority defaults are SLA = critical,
-backlog = warning. All notifications belong to the trusted demo team lead.
+backlog = warning. Use **Add a queue** on the rules page to register another
+queue ID and display name. New queues wait for observations; registration does
+not create tickets or an upstream integration. All notifications belong to the trusted demo team lead.
 
 ## JSONL replay
 
 Import `fixtures/synthetic-queues.jsonl` into a fresh workspace after configuring
 the two Billing rules. Its seven events produce **four** notifications and leave
 two active violations. Re-importing the same file creates no new notifications.
-The assignment's actual `events.jsonl` has not been supplied yet.
+The actual assignment feed has also been validated in an isolated environment;
+use the environment-variable command below to reproduce the dataset regression.
 
 The importer accepts queue snapshots in the assignment schema, including UTC
 `ts` strings in `YYYY-MM-DDTHH:MM:SSZ` format. The four contextual metrics
@@ -73,6 +76,13 @@ partway through evaluation. The current workspace is not implicitly reset.
 
 ## Product semantics
 
+- Equivalent definitions (queue, rule type, and backlog threshold) cannot be
+  created or edited into duplicates. HTTP 409 identifies the existing rule,
+  even if it is disabled. Existing duplicates in old state are preserved rather
+  than silently deleted. A no-op edit of a rule is allowed.
+- Queue IDs are explicitly registered in a shared, persisted catalog. Unknown
+  queues are rejected in events and rule definitions. Queue IDs are stable,
+  lowercase identifiers; display names can be changed in a future extension.
 - Comparisons are strict: 20 tickets do not violate a threshold of 20; oldest
   wait equal to the SLA target is not a breach.
 - One notification is created per continuous violation, per rule and queue.
@@ -105,15 +115,22 @@ partway through evaluation. The current workspace is not implicitly reset.
 | File | Responsibility |
 | --- | --- |
 | `queue_rule.hpp`, `queue_snapshot.hpp` | Rule and observation data types |
-| `rule_collection.*` | In-memory configuration validation and ID assignment |
-| `notification_engine.*` | Evaluation, episodes, deduplication, and per-queue ordering |
+| `queue_catalog.hpp` | Shared queue registration and validation |
+| `rule_collection.*` | Configuration validation, duplicate prevention, ID and queue indexes |
+| `notification_engine.*` | Indexed evaluation, episodes, deduplication, retention, and per-queue ordering |
+| `lifecycle.hpp`, `errors.hpp` | Typed lifecycle values and domain error categories |
 | `engine_state.cpp` | Encode and validate persisted engine state |
 | `json_codec.hpp` | JSON conversion and typed input validation |
 | `application.*` | Serialize mutations; propose, save, and publish complete state |
 | `server.cpp` | HTTP routes, local-only serving, and writer lock |
 | `web/` | Dashboard, rule editor, toasts, and polling |
 | `fixtures/` | Labeled synthetic data with known outcomes |
-| `main.cpp`, `rule_store.*` | Earlier terminal prototype, retained for learning/regression |
+
+Schema-1 JSON snapshots still load with the original catalog; the next save
+writes schema 2, including the catalog and stable notification-ID counter.
+Existing rules and observations are preserved. Back up your state before a
+version upgrade; older binaries cannot read schema 2. Legacy duplicate definitions
+remain until the lead explicitly changes or disables them.
 
 The browser displays decisions; it never evaluates rules. A mutex serializes
 application reads and writes within the process. An advisory file lock rejects
@@ -134,12 +151,20 @@ save can restore the state and safely handle event retries. Corrupt or unsupport
 state stops startup and is not silently replaced.
 
 This is a **single-process, single-writer** design. Whole-state copies and writes
-are deliberately simple, not a high-throughput event store. Event IDs and history
-are unbounded until the 32 MiB snapshot limit; reaching it rejects further saves.
-There is no automatic retention policy. HTTP payloads are capped at 2 MiB.
+are deliberately simple, not a high-throughput event store. The dashboard's **Manage retained history** control offers explicit compaction.
+It keeps the requested recent notifications/events plus all active alerts,
+notification source events, and all queue-watermark events (including timestamp
+ties). Active records can exceed the chosen targets. Removed history is permanent;
+after an old event ID is evicted, its retry is no longer classified as a duplicate
+or conflict, but its older timestamp still cannot change current queue state.
+IDs are never renumbered or reused after cleanup. Cleanup is not automatic, so
+normal saves never silently delete history. Archive your state before pruning.
+The 32 MiB hard snapshot limit still rejects oversized saves. HTTP payloads are capped at 2 MiB.
 
-The temporary file is fsynced, but the parent directory is not; we do **not**
-promise complete machine/power-loss durability. There is no claim of exactly-once
+The temporary file is fsynced. After atomic rename, the parent directory is
+also fsynced when supported. Directory-sync failure is logged rather than
+incorrectly reporting that a committed rename was rolled back. We still do
+**not** claim complete machine/power-loss durability across all platforms. There is no claim of exactly-once
 external delivery or exactly-once browser toasts. Production evolution would need
 retention, stronger durable storage, and partitioned processing, with a per-entity
 ordering contract. A circuit breaker, MCP server, or consensus cluster does not
@@ -151,12 +176,13 @@ solve the failures addressed by this MVP.
 ./test.sh
 ```
 
-This builds the server, runs 14 configuration unit tests and 18 notification
-unit tests, then runs the existing terminal integration suite and the HTTP/
-persistence suite. Every test has a comment describing its purpose. HTTP tests
+This builds the server, runs 17 configuration unit tests and 20 notification
+unit tests, then runs 24 HTTP/persistence tests. Three additional regressions
+use the supplied assignment file when configured; otherwise they are explicitly skipped. Every test has a comment describing its purpose. HTTP tests
 use isolated state files and cover immediate rule evaluation, edits, independent
 recoveries, priority, abrupt process restart, duplicate/stale/conflicting events,
-batch rollback, failed saves, writer exclusion, and corrupt-state preservation.
+batch rollback, failed saves, writer exclusion, and corrupt-state preservation, schema migration, queue creation, duplicate
+configuration prevention, and retention with stable IDs.
 
 Optional browser acceptance checks require Python Playwright and a Chromium
 installation (already available in the development environment):
@@ -170,22 +196,38 @@ This test uses temporary state, operates the real forms, verifies toasts and
 recovery, and checks desktop/mobile layouts. Screenshots go to
 `/tmp/intraday-artifacts` by default; override with `ARTIFACT_DIR`.
 
+To include the supplied assignment feed without committing it to the repository:
+
+```sh
+INTRADAY_EVENTS_FILE=/path/to/events.jsonl bash test.sh
+```
+
+These three checks independently calculate expected episodes, compare actual
+notification evidence, re-import after restart/cleanup, and exercise original
+arrival ordering. With Billing backlog >20 and SLA rules, the reviewed file
+creates two recovered notifications. With the same two rule types on all three
+queues, it creates three. It contains 24 queue events and 72 explicitly skipped
+agent events. The feed includes a null forecast, a late VIP observation, and a
+conflicting repeated adherence ID outside this MVP's evaluated scope.
+
 ## HTTP API
 
 | Method | Endpoint | Purpose |
 | --- | --- | --- |
 | GET | `/api/health` | Process readiness |
 | GET | `/api/state` | Queue metrics, rules, active alerts, and history |
+| POST | `/api/queues` | Explicitly register a queue ID and display name |
 | POST | `/api/rules` | Create a rule; immediately evaluate latest data |
 | PATCH | `/api/rules/{id}` | Replace definition and/or change enabled state |
 | POST | `/api/events` | Ingest one queue snapshot |
 | POST | `/api/replay` | Import raw JSONL atomically |
 | POST | `/api/demo/next` | Advance one synthetic scenario step |
+| POST | `/api/maintenance/compact` | Explicitly prune unprotected historical state |
 
 Mutation requests require `X-Intraday-Client: dashboard`. The backend provides no
 cross-origin permissions. This reduces accidental cross-site mutations; it is
 not an authentication mechanism. Errors use 400 for validation, 404 for unknown
-rule IDs, 409 for conflicting event IDs, and 500 for failed persistence.
+rule IDs, 409 for conflicting event IDs, duplicate queues, or equivalent rules, and 500 for failed persistence.
 
 ## Interview framing and AI use
 

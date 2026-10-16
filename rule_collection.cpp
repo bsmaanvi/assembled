@@ -7,39 +7,31 @@
 #include <utility>
 
 namespace intraday {
-namespace {
-auto find_rule(std::vector<QueueRule>& rules, int id) {
-    const auto found = std::find_if(rules.begin(), rules.end(),
-        [id](const QueueRule& rule) { return rule.id == id; });
-    if (found == rules.end()) throw std::invalid_argument("No rule with that ID.");
-    return found;
-}
-} // namespace
-
 // constructor with rules passed
-RuleCollection::RuleCollection(std::vector<QueueRule> rules) {
+RuleCollection::RuleCollection(std::vector<QueueRule> rules, QueueCatalog catalog) : catalog_(std::move(catalog)) {
     std::set<int> ids;
     for (const auto& rule : rules) {
         if (rule.id <= 0 || !ids.insert(rule.id).second)
-            throw std::invalid_argument("Rule IDs must be positive and unique.");
+            throw DomainError(ErrorCode::InvalidInput, "Rule IDs must be positive and unique.");
         validate_definition(rule.definition);
     }
     rules_ = std::move(rules);
+    rebuild_index();
 }
  
 // read the stored rules
 const std::vector<QueueRule>& RuleCollection::rules() const { return rules_; }
 
 
-void RuleCollection::validate_definition(const RuleDefinition& definition) {
-    std::visit([](const auto& value) {
+void RuleCollection::validate_definition(const RuleDefinition& definition) const {
+    std::visit([this](const auto& value) {
         const auto& id = value.queue_id;
-        if (id != "billing" && id != "tier_2" && id != "vip")
-            throw std::invalid_argument("Unknown queue ID.");
+        if (!catalog_.contains(id))
+            throw DomainError(ErrorCode::InvalidInput, "Unknown queue ID.");
     }, definition);
     if (const auto* backlog = std::get_if<BacklogRule>(&definition);
         backlog && backlog->tickets_waiting_threshold < 0)
-        throw std::invalid_argument("Threshold must be nonnegative.");
+        throw DomainError(ErrorCode::InvalidInput, "Threshold must be nonnegative.");
 }
 // stretch goal 
 // I distinguish restoring trusted application state from importing user input.
@@ -48,23 +40,65 @@ void RuleCollection::validate_definition(const RuleDefinition& definition) {
 
 int RuleCollection::create(RuleDefinition definition) {
     validate_definition(definition);
-    int maximum = 0;
-    for (const auto& rule : rules_) maximum = std::max(maximum, rule.id);
-    if (maximum == std::numeric_limits<int>::max())
+    reject_equivalent(definition);
+    if (next_id_ > std::numeric_limits<int>::max())
         throw std::runtime_error("No rule IDs available.");
-    const int id = maximum + 1;
+    const int id = static_cast<int>(next_id_);
     rules_.push_back({id, true, std::move(definition)});
+    ++next_id_;
+    rebuild_index();
     return id;
 }
 
 void RuleCollection::edit(int id, RuleDefinition definition) {
-    const auto found = find_rule(rules_, id);
+    const auto position = positions_.find(id);
+    if (position == positions_.end()) throw DomainError(ErrorCode::NotFound, "No rule with that ID.");
+    auto& found = rules_[position->second];
     validate_definition(definition);
-    found->definition = std::move(definition);
+    if (found.definition == definition) return;
+    reject_equivalent(definition, id);
+    found.definition = std::move(definition);
+    rebuild_index();
 }
 
 void RuleCollection::set_enabled(int id, bool enabled) {
-    find_rule(rules_, id)->enabled = enabled;
+    const auto position = positions_.find(id);
+    if (position == positions_.end()) throw DomainError(ErrorCode::NotFound, "No rule with that ID.");
+    rules_[position->second].enabled = enabled;
+}
+
+// Existing saved duplicates are preserved; new create/edit operations cannot add them.
+void RuleCollection::reject_equivalent(const RuleDefinition& definition, int except_id) const {
+    for (const auto& rule : rules_)
+        if (rule.id != except_id && rule.definition == definition)
+            throw DomainError(ErrorCode::Conflict,
+                "Equivalent rule already exists (#" + std::to_string(rule.id) + "). Edit or enable it instead.", rule.id);
+}
+
+void RuleCollection::rebuild_index() {
+    positions_.clear();
+    queue_rules_.clear();
+    for (std::size_t index = 0; index < rules_.size(); ++index) {
+        const auto& rule = rules_[index];
+        positions_[rule.id] = index;
+        const auto& queue = std::visit([](const auto& definition) -> const std::string& {
+            return definition.queue_id;
+        }, rule.definition);
+        queue_rules_[queue].push_back(rule.id);
+        next_id_ = std::max(next_id_, static_cast<std::int64_t>(rule.id) + 1);
+    }
+}
+
+const QueueRule& RuleCollection::at(int id) const {
+    const auto found = positions_.find(id);
+    if (found == positions_.end()) throw DomainError(ErrorCode::NotFound, "No rule with that ID.");
+    return rules_.at(found->second);
+}
+
+const std::vector<int>& RuleCollection::for_queue(const std::string& id) const {
+    static const std::vector<int> empty;
+    const auto found = queue_rules_.find(id);
+    return found == queue_rules_.end() ? empty : found->second;
 }
 
 } // namespace intraday
