@@ -17,8 +17,10 @@ struct SlaBreachRule {
     bool operator==(const SlaBreachRule&) const = default;
 };
 
+// rule definition can be either backlogrule or slabreachrule
 using RuleDefinition = std::variant<BacklogRule, SlaBreachRule>;
 
+// we differentiate between the rules based on the id
 struct QueueRule {
     int id;
     bool enabled = true;
