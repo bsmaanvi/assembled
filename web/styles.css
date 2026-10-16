@@ -897,3 +897,39 @@ footer span {
     max-width:250px
   }
 }
+
+/* Context belongs to its queue; actual and forecast volumes use distinct windows. */
+.queue-context-row td {
+  padding: 0 16px 17px 22px;
+  background: #fcfcfe;
+  white-space: normal;
+}
+.queue-context {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  padding-top: 10px;
+}
+.queue-context small {
+  display: block;
+  color: var(--muted);
+  font-size: 9px;
+}
+.queue-context strong {
+  display: block;
+  font-size: 11px;
+  font-weight: 600;
+  margin-top: 3px;
+}
+.queue-metric-row td {
+  border-bottom: 0;
+}
+.notification-context {
+  color: var(--muted);
+  font-size: 10px;
+}
+@media (max-width: 760px) {
+  .queue-context {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

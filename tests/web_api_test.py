@@ -236,6 +236,84 @@ class WebApiTests(unittest.TestCase):
                 self.assertEqual(self.path.read_text(), content)
 
 
+    # Staffing and volume survive ingestion/restart; notifications retain original context.
+    def test_queue_context_and_notification_evidence(self):
+        self.rule()
+        first = {'type': 'queue_snapshot', 'event_id': 'context-1', 'observed_at_sec': 100,
+                 'queue_id': 'billing', 'tickets_waiting': 23, 'longest_wait_sec': 90,
+                 'sla_target_sec': 120, 'agents_available': 4, 'agents_on_call': 12,
+                 'volume_last_15m': 78, 'volume_forecast_next_15m': 50}
+        response = self.request('/api/events', 'POST', first)
+        self.assertEqual(response['new_notifications'][0]['context']['agents_available'], 4)
+        second = {**first, 'event_id': 'context-2', 'observed_at_sec': 101,
+                  'agents_available': 0, 'agents_on_call': 16, 'volume_last_15m': 90,
+                  'volume_forecast_next_15m': 70}
+        self.request('/api/events', 'POST', second)
+        view = self.view()
+        self.assertEqual(view['queues'][0]['snapshot']['agents_available'], 0)
+        self.assertEqual(view['queues'][0]['snapshot']['volume_forecast_next_15m'], 70)
+        self.assertEqual(view['active_alerts'][0]['context']['agents_on_call'], 16)
+        self.assertEqual(len(view['notifications']), 1)
+        self.assertEqual(view['notifications'][0]['context']['agents_on_call'], 12)
+        self.assertEqual(view['notifications'][0]['context']['volume_last_15m'], 78)
+        self.stop()
+        self.start()
+        self.assertEqual(self.view(), view)
+        self.assertEqual(self.request('/api/events', 'POST', second)['outcome'], 'duplicate')
+        self.request('/api/events', 'POST', {**second, 'agents_available': 1}, status=409)
+        self.assertEqual(self.view(), view)
+
+    # Optional metrics must be nonnegative integers; rejection must not consume event IDs.
+    def test_invalid_context_is_rejected(self):
+        before = self.view()
+        event = {'type': 'queue_snapshot', 'event_id': 'context', 'observed_at_sec': 100,
+                 'queue_id': 'billing', 'tickets_waiting': 23, 'longest_wait_sec': 90,
+                 'sla_target_sec': 120}
+        for field in ('agents_available', 'agents_on_call', 'volume_last_15m', 'volume_forecast_next_15m'):
+            for invalid in (-1, 1.5, '4', True, 2147483648):
+                with self.subTest(field=field, value=invalid):
+                    self.request('/api/events', 'POST', {**event, field: invalid}, status=400)
+                    self.assertEqual(self.view(), before)
+        self.assertEqual(self.request('/api/events', 'POST', event)['outcome'], 'processed')
+        self.assertIsNone(self.view()['queues'][0]['snapshot']['agents_available'])
+
+    # Older snapshot files without context fields still restore without inventing zeros.
+    def test_legacy_state_restores_missing_context(self):
+        self.rule()
+        self.event('legacy')
+        self.stop()
+        saved = json.loads(self.path.read_text())
+        fields = ('agents_available', 'agents_on_call', 'volume_last_15m', 'volume_forecast_next_15m')
+        for collection in ('events', 'latest'):
+            for event in saved['engine'][collection]:
+                for field in fields:
+                    event.pop(field, None)
+        for notification in saved['engine']['notifications']:
+            notification.pop('context', None)
+        self.path.write_text(json.dumps(saved))
+        self.start()
+        view = self.view()
+        for field in fields:
+            self.assertIsNone(view['queues'][0]['snapshot'][field])
+            self.assertIsNone(view['notifications'][0]['context'][field])
+        self.assertEqual(self.event('legacy')['outcome'], 'duplicate')
+
+    # Persisted notification context must match its source event, not silently drift.
+    def test_corrupt_notification_context_is_rejected(self):
+        self.rule()
+        self.event('first')
+        self.stop()
+        saved = json.loads(self.path.read_text())
+        saved['engine']['notifications'][0]['context']['agents_available'] = 99
+        content = json.dumps(saved)
+        self.path.write_text(content)
+        result = subprocess.run([str(BINARY), '--state', str(self.path), '--web', str(ROOT / 'web')],
+                                capture_output=True, text=True, timeout=5)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('context disagrees', result.stderr)
+        self.assertEqual(self.path.read_text(), content)
+
+
 if __name__ == '__main__':
     if not BINARY.exists():
         raise SystemExit('Run ./build.sh first')

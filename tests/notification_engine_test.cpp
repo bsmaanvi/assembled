@@ -207,6 +207,45 @@ void invalid_rules_do_not_consume_events() {
     check(engine.process(event, {{1, true, BacklogRule{"billing", 20}}}).new_notifications.size() == 1,
           "Valid retry must be processed");
 }
+// Alert evidence keeps its triggering context while current queue metrics update.
+void context_is_captured_without_changing_suppression() {
+    NotificationEngine engine;
+    const std::vector<QueueRule> rules{{1, true, BacklogRule{"billing", 20}}};
+    auto first = snapshot("first", 1, 23);
+    first.agents_available = 4;
+    first.agents_on_call = 12;
+    first.volume_last_15m = 78;
+    first.volume_forecast_next_15m = 50;
+    const auto result = engine.process(first, rules);
+    check(result.new_notifications.size() == 1 &&
+          result.new_notifications[0].context == first, "Notification must capture source snapshot");
+    auto next = first;
+    next.event_id = "next";
+    next.observed_at_sec = 2;
+    next.agents_available = 0;
+    next.volume_last_15m = 90;
+    check(engine.process(next, rules).new_notifications.empty(), "Context change alone must not repeat alert");
+    check(engine.latest_snapshots().at("billing").agents_available == 0, "Current dashboard context updates");
+    check(engine.notifications()[0].context->agents_available == 4 &&
+          engine.notifications()[0].context->volume_last_15m == 78, "History must not use newer context");
+}
+
+// Missing context is unknown, zeros are valid, and negative counts are rejected.
+void optional_context_validation() {
+    NotificationEngine engine;
+    auto missing = snapshot("missing", 1, 0);
+    engine.process(missing, {});
+    check(!engine.latest_snapshots().at("billing").agents_available, "Missing must not become zero");
+    auto negative = snapshot("retry", 2, 0);
+    negative.agents_available = -1;
+    rejects([&] { engine.process(negative, {}); });
+    negative.agents_available = 0;
+    negative.agents_on_call = 0;
+    negative.volume_last_15m = 0;
+    negative.volume_forecast_next_15m = 0;
+    check(engine.process(negative, {}).outcome == SnapshotOutcome::Processed,
+          "Rejected context must not consume event ID; zero counts are valid");
+}
 } // namespace
 
 int main() {
@@ -227,6 +266,8 @@ int main() {
         {"explicit reset", explicit_reset_preserves_history},
         {"removed rules", removed_rules_drop_state},
         {"invalid rule input", invalid_rules_do_not_consume_events},
+        {"notification context preserves evidence", context_is_captured_without_changing_suppression},
+        {"optional context validation", optional_context_validation},
     };
     int failures = 0;
     for (const auto& [name, run] : tests) {

@@ -106,6 +106,7 @@ Json Application::view() const {
             encoded["observed_value"] = backlog ? snapshot.tickets_waiting : snapshot.longest_wait_sec;
             encoded["threshold"] = backlog ? std::get<BacklogRule>(rule.definition).tickets_waiting_threshold : snapshot.sla_target_sec;
             encoded["observed_at_sec"] = snapshot.observed_at_sec;
+            encoded["context"] = snapshot_json(snapshot);
             for (auto notification = state_.engine.notifications().rbegin(); notification != state_.engine.notifications().rend(); ++notification) {
                 if (notification->rule_id == rule.id && notification->close_reason.empty()) {
                     encoded["notification_id"] = notification->id;
@@ -217,8 +218,14 @@ Json Application::next_demo() {
         (void)id;
         timestamp = std::max(timestamp, snapshot.observed_at_sec + 30);
     }
-    const auto result = candidate.engine.process({"synthetic-demo-" + std::to_string(candidate.demo_cursor),
-        timestamp, queue, waiting, oldest, sla}, candidate.rules.rules());
+    QueueSnapshot snapshot{"synthetic-demo-" + std::to_string(candidate.demo_cursor),
+        timestamp, queue, waiting, oldest, sla};
+    // Synthetic context for the demo, not an inference from backlog or SLA.
+    snapshot.agents_available = waiting > 20 ? 4 : 6;
+    snapshot.agents_on_call = waiting > 20 ? 12 : 10;
+    snapshot.volume_last_15m = waiting > 20 ? 78 : 60;
+    snapshot.volume_forecast_next_15m = 50;
+    const auto result = candidate.engine.process(snapshot, candidate.rules.rules());
     ++candidate.demo_cursor;
     commit(std::move(candidate));
     auto response = result_json(result);

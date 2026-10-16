@@ -42,7 +42,7 @@ def main():
                     page.on('pageerror', lambda error: errors.append(str(error)))
                     page.goto(base)
                     expect(page.locator('#connection')).to_have_text('Backend connected')
-                    expect(page.locator('#queue-rows tr')).to_have_count(3)
+                    expect(page.locator('#queue-rows .queue-metric-row')).to_have_count(3)
 
                     # Configure both rules through the actual form.
                     page.get_by_role('link', name='Configure rules').click()
@@ -64,6 +64,16 @@ def main():
                     expect(page.locator('.alert-item').first).to_contain_text('SLA breach')
                     expect(page.locator('#history .history-row')).to_have_count(2)
                     expect(page.locator('.toast')).to_have_count(2)
+                    # Queue metrics and active alerts show current context, while
+                    # toasts and history retain the original triggering snapshot.
+                    billing_context = page.locator('.queue-context').first
+                    expect(billing_context).to_contain_text('Available agents4')
+                    expect(billing_context).to_contain_text('Agents on calls12')
+                    expect(billing_context).to_contain_text('Volume · last 15m78')
+                    expect(billing_context).to_contain_text('Forecast · next 15m50')
+                    expect(page.locator('.alert-item').first).to_contain_text('Available agents: 4')
+                    expect(page.locator('#history')).to_contain_text('Forecast (next 15m): 50')
+                    expect(page.locator('.toast').last).to_contain_text('Agents on calls: 12')
 
                     # Capture the dashboard at desktop and mobile dimensions.
                     artifact_dir = Path(os.environ.get('ARTIFACT_DIR', '/tmp/intraday-artifacts'))

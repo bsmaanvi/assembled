@@ -9,3 +9,7 @@ uses input timestamps and stable chronological sorting, not wall-clock delays.
 Use a fresh state file for this scenario. Importing earlier observations after
 a later demo correctly reports them as stale. The UI always imports into the
 current workspace; it does not reset existing state.
+
+Staffing and volume counts are synthetic as well. They provide dashboard and
+notification context without adding new trigger conditions. Forecast volume
+covers the next 15 minutes, not the actual-volume observation window.

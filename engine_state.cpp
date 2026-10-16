@@ -72,6 +72,12 @@ NotificationEngine NotificationEngine::restore(const std::string& text,
             std::none_of(rules.begin(), rules.end(), [&](const auto& rule) { return rule.id == notification.rule_id; }))
             throw std::runtime_error("Invalid notification in saved state.");
         const auto& event = engine.events_.at(notification.event_id);
+        // Older state files had no notification context. The original event is
+        // still available, so restore only what it actually reported.
+        notification.context = value.contains("context") && !value.at("context").is_null()
+            ? snapshot_from_json(value.at("context")) : event;
+        if (*notification.context != event)
+            throw std::runtime_error("Notification context disagrees with its source event.");
         if ((notification.rule_type != "backlog" && notification.rule_type != "sla") ||
             (notification.trigger != "event" && notification.trigger != "rule_change") ||
             (notification.close_reason != "" && notification.close_reason != "recovered" &&

@@ -22,6 +22,11 @@ void validate_snapshot(const QueueSnapshot& snapshot) {
         throw std::invalid_argument("Observation time must be Unix seconds between 1970 and 9999.");
     if (snapshot.tickets_waiting < 0 || snapshot.longest_wait_sec < 0)
         throw std::invalid_argument("Queue metrics must be nonnegative.");
+    for (const auto& metric : {snapshot.agents_available, snapshot.agents_on_call,
+                              snapshot.volume_last_15m, snapshot.volume_forecast_next_15m}) {
+        if (metric && *metric < 0)
+            throw std::invalid_argument("Staffing and volume metrics must be nonnegative when reported.");
+    }
     if (snapshot.sla_target_sec <= 0)
         throw std::invalid_argument("SLA target must be positive.");
 }
@@ -68,6 +73,7 @@ std::vector<Notification> NotificationEngine::evaluate(
         : "Oldest wait " + std::to_string(observed) + "s exceeds SLA target " + std::to_string(threshold) + "s";
     Notification notification{notifications_.size() + 1, rule.id, snapshot.event_id,
         snapshot.queue_id, snapshot.observed_at_sec, observed, threshold, explanation, "", trigger, backlog ? "backlog" : "sla"};
+    notification.context = snapshot;
     notifications_.push_back(notification);
     state.firing = true;
     state.notification_id = notification.id;

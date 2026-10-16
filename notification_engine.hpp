@@ -24,6 +24,8 @@ struct Notification {
     std::string close_reason; // Empty while active; history retains original evidence.
     std::string trigger = "event";
     std::string rule_type = "backlog";
+    // Evidence at notification creation, not the queue's later/current state.
+    std::optional<QueueSnapshot> context = std::nullopt;
 };
 
 struct SnapshotResult {

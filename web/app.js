@@ -20,6 +20,13 @@ function duration(seconds) {
   const minutes = Math.floor(seconds / 60), remainder = seconds % 60;
   return `${minutes}m${remainder ? ` ${remainder}s` : ''}`;
 }
+function metric(value) { return value == null ? 'Not reported' : String(value); }
+function staffingText(snapshot) {
+  return `Available agents: ${metric(snapshot?.agents_available)} · Agents on calls: ${metric(snapshot?.agents_on_call)}`;
+}
+function volumeText(snapshot) {
+  return `Volume (last 15m): ${metric(snapshot?.volume_last_15m)} · Forecast (next 15m): ${metric(snapshot?.volume_forecast_next_15m)}`;
+}
 function timeLabel(seconds) {
   const date = new Date(seconds * 1000);
   return `${date.toISOString().slice(0, 10)} · ${date.toISOString().slice(11, 19)} UTC`;
@@ -58,7 +65,7 @@ function renderQueues(state) {
   $('stat-alerts-detail').textContent = state.active_alerts.length ? `${critical} critical · ${state.active_alerts.length - critical} warning` : 'No active violations';
   $('stat-rules').textContent = state.rules.filter(rule => rule.enabled).length;
   for (const queue of state.queues) {
-    const row = element('tr'), title = element('td'), name = element('div', 'queue-name');
+    const row = element('tr', 'queue-metric-row'), title = element('td'), name = element('div', 'queue-name');
     name.append(element('span', 'queue-icon', queue.id === 'billing' ? 'B' : queue.id === 'vip' ? 'V' : 'T'), document.createTextNode(queue.name));
     title.append(name, element('small', 'observation', queue.snapshot ? timeLabel(queue.snapshot.observed_at_sec) : 'Waiting for first observation'));
     row.append(title);
@@ -70,6 +77,18 @@ function renderQueues(state) {
     status.append(!snapshot ? badge('No data') : snapshot.longest_wait_sec > snapshot.sla_target_sec ? badge('SLA breached', 'critical') : badge('Within SLA', 'clear'));
     row.append(status);
     $('queue-rows').append(row);
+    const contextRow = element('tr', 'queue-context-row'), cell = element('td');
+    cell.colSpan = 5;
+    const context = element('div', 'queue-context');
+    for (const [label, value] of [
+      ['Available agents', snapshot?.agents_available], ['Agents on calls', snapshot?.agents_on_call],
+      ['Volume · last 15m', snapshot?.volume_last_15m], ['Forecast · next 15m', snapshot?.volume_forecast_next_15m],
+    ]) {
+      const field = element('div');
+      field.append(element('small', '', label), element('strong', '', metric(value)));
+      context.append(field);
+    }
+    cell.append(context); contextRow.append(cell); $('queue-rows').append(contextRow);
   }
 }
 function renderAlerts(state) {
@@ -92,6 +111,7 @@ function renderAlerts(state) {
       const item = element('div', 'alert-item');
       item.append(badge(alert.type === 'sla' ? 'SLA breach' : 'Backlog', alert.severity));
       item.append(element('p', '', alert.type === 'sla' ? `Oldest wait ${duration(alert.observed_value)} / target ${duration(alert.threshold)}` : `${alert.observed_value} waiting / threshold ${alert.threshold}`));
+      item.append(element('p', 'notification-context', staffingText(alert.context)));
       item.append(element('small', '', `Rule #${alert.id} · ${timeLabel(alert.observed_at_sec)}`));
       group.append(item);
     }
@@ -110,6 +130,8 @@ function renderHistory(state) {
     const row = element('article', 'history-row'), body = element('div', 'history-body'), meta = element('div', 'history-meta');
     body.append(element('strong', '', `${names[notification.queue_id]} · ${notification.severity === 'critical' ? 'SLA breach' : 'Queue backlog'}`));
     body.append(element('p', '', notification.explanation));
+    body.append(element('p', 'notification-context', staffingText(notification.context)));
+    body.append(element('p', 'notification-context', volumeText(notification.context)));
     body.append(element('small', '', `Rule #${notification.rule_id} · ${timeLabel(notification.observed_at_sec)} · ${notification.trigger === 'rule_change' ? 'Triggered on rule save' : 'Triggered by event'} · ${notification.event_id}`));
     meta.append(badge(notification.close_reason ? reason[notification.close_reason] || notification.close_reason : 'Active', notification.close_reason ? 'neutral' : notification.severity));
     meta.append(element('small', '', `Notification #${notification.id}`));
@@ -145,6 +167,7 @@ function toast(notification) {
   close.type = 'button'; close.setAttribute('aria-label', 'Dismiss notification toast');
   close.addEventListener('click', () => node.remove());
   node.append(element('strong', '', `${names[notification.queue_id]} · ${notification.severity === 'critical' ? 'Critical' : 'Warning'}`), element('p', '', notification.explanation), close);
+  node.append(element('p', 'notification-context', staffingText(notification.context)));
   $('toasts').append(node);
   while ($('toasts').children.length > 3) $('toasts').firstElementChild.remove();
   setTimeout(() => node.remove(), 9000);

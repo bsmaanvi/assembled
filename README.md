@@ -2,7 +2,8 @@
 
 A C++20 backend with a small browser dashboard. Configure queue backlog and SLA
 rules, replay observations, and see prioritized active violations, notification
-history, and new-alert toasts. No SQL or external service is required.
+history, new-alert toasts, and staffing/volume context for each queue. No SQL or
+external service is required.
 
 ## Run
 
@@ -60,7 +61,11 @@ two active violations. Re-importing the same file creates no new notifications.
 The assignment's actual `events.jsonl` has not been supplied yet.
 
 The importer accepts queue snapshots in the assignment schema, including UTC
-`ts` strings in `YYYY-MM-DDTHH:MM:SSZ` format. Extra metrics are currently unused.
+`ts` strings in `YYYY-MM-DDTHH:MM:SSZ` format. The four contextual metrics
+`agents_available`, `agents_on_call`, `volume_last_15m`, and
+`volume_forecast_next_15m` are stored and displayed. They are optional,
+nonnegative integer counts: omitted/null fields mean **not reported**, not zero.
+Older state files still load; previously discarded values cannot be recovered.
 Known agent event types are skipped and counted explicitly; other event types
 are rejected. Queue events are stably sorted by timestamp. Equal-time events
 retain input order. A bad batch makes no changes, including conflicts discovered
@@ -79,11 +84,18 @@ partway through evaluation. The current workspace is not implicitly reset.
   violated; edits that clear it record a configuration-change reason. Changing
   the rule type or queue ends the previous episode and evaluates the new scope.
 - Disabling closes the active episode without claiming the queue recovered.
-- Duplicate event IDs with identical monitored fields are ignored. Reusing an ID
-  with different monitored fields returns a conflict. Unused extra fields are
-  not part of this normalized identity.
+- Duplicate event IDs with identical retained snapshot fields are ignored. Reusing an ID
+  with different retained fields returns a conflict. Fields outside our snapshot model are
+  not part of this normalized identity. Staffing and volume counts are included.
 - Events older than a queue's latest accepted observation cannot overwrite its
   metrics or clear its alerts. Their IDs are still retained for safe retries.
+- The dashboard shows current available/on-call counts and distinct actual
+  (last 15 minutes) / forecast (next 15 minutes) volumes. These are different
+  windows, so their comparison is not a forecast-error measurement. Low
+  availability does not establish that agents are offline or caused a breach.
+- Active alerts show current staffing. Toasts and history include the original
+  triggering snapshot's staffing/volume context, which later snapshots and
+  rule edits do not rewrite. Contextual changes alone do not create new alerts.
 - The frontend polls every 1.5 seconds. On initial load it shows history without
   replaying old toasts. Toast display is best-effort; persisted notification
   creation is independent of browser connectivity.
@@ -139,7 +151,7 @@ solve the failures addressed by this MVP.
 ./test.sh
 ```
 
-This builds the server, runs 14 configuration unit tests and 16 notification
+This builds the server, runs 14 configuration unit tests and 18 notification
 unit tests, then runs the existing terminal integration suite and the HTTP/
 persistence suite. Every test has a comment describing its purpose. HTTP tests
 use isolated state files and cover immediate rule evaluation, edits, independent
@@ -178,8 +190,10 @@ rule IDs, 409 for conflicting event IDs, and 500 for failed persistence.
 ## Interview framing and AI use
 
 The product decision is a focused queue-monitoring workflow for team leads.
-Agent self-reminders, supervisor summaries, long-call timers, forecasts, and real
-notification integrations are deferred. Demonstrate a complete configuration →
+Agent self-reminders, supervisor summaries, long-call timers, forecast-based rules, and real
+notification integrations are deferred. Composite staffing/backlog rules and
+individual-agent offline tracking are also deferred; this change adds context,
+not an unsupported inference about staffing causes. Demonstrate a complete configuration →
 observation → alert → suppression → recovery loop before discussing extensions.
 
 The systems-design contribution is idempotency, per-queue ordering, and atomic

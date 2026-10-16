@@ -66,10 +66,24 @@ inline QueueRule rule_from_json(const Json& value) {
             value.at("enabled").get<bool>(), definition_from_json(value)};
 }
 
+// Optional fields support legacy files and feeds that omit contextual metrics.
+inline std::optional<int> optional_metric(const Json& value, const std::string& field) {
+    if (!value.contains(field) || value.at(field).is_null()) return std::nullopt;
+    return static_cast<int>(integer(value.at(field), field));
+}
+
+inline Json metric_json(const std::optional<int>& value) {
+    return value ? Json(*value) : Json(nullptr);
+}
+
 inline Json snapshot_json(const QueueSnapshot& value) {
     return {{"event_id", value.event_id}, {"observed_at_sec", value.observed_at_sec},
             {"queue_id", value.queue_id}, {"tickets_waiting", value.tickets_waiting},
-            {"longest_wait_sec", value.longest_wait_sec}, {"sla_target_sec", value.sla_target_sec}};
+            {"longest_wait_sec", value.longest_wait_sec}, {"sla_target_sec", value.sla_target_sec},
+            {"agents_available", metric_json(value.agents_available)},
+            {"agents_on_call", metric_json(value.agents_on_call)},
+            {"volume_last_15m", metric_json(value.volume_last_15m)},
+            {"volume_forecast_next_15m", metric_json(value.volume_forecast_next_15m)}};
 }
 
 inline QueueSnapshot snapshot_from_json(const Json& value) {
@@ -81,7 +95,9 @@ inline QueueSnapshot snapshot_from_json(const Json& value) {
             value.at("queue_id").get<std::string>(),
             static_cast<int>(integer(value.at("tickets_waiting"), "tickets_waiting")),
             static_cast<int>(integer(value.at("longest_wait_sec"), "longest_wait_sec")),
-            static_cast<int>(integer(value.at("sla_target_sec"), "sla_target_sec", 1))};
+            static_cast<int>(integer(value.at("sla_target_sec"), "sla_target_sec", 1)),
+            optional_metric(value, "agents_available"), optional_metric(value, "agents_on_call"),
+            optional_metric(value, "volume_last_15m"), optional_metric(value, "volume_forecast_next_15m")};
 }
 
 inline Json notification_json(const Notification& value) {
@@ -89,6 +105,7 @@ inline Json notification_json(const Notification& value) {
             {"queue_id", value.queue_id}, {"observed_at_sec", value.observed_at_sec},
             {"observed_value", value.observed_value}, {"threshold", value.threshold},
             {"explanation", value.explanation}, {"close_reason", value.close_reason},
-            {"trigger", value.trigger}, {"rule_type", value.rule_type}};
+            {"trigger", value.trigger}, {"rule_type", value.rule_type},
+            {"context", value.context ? snapshot_json(*value.context) : Json(nullptr)}};
 }
 } // namespace intraday
